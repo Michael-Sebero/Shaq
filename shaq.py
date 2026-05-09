@@ -47,7 +47,10 @@ def _check_and_install(specs: list[str]) -> None:
 
     if missing:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+            [sys.executable, "-m", "pip", "install", "--quiet", *missing],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         print("[shaq] Dependencies installed — continuing.\n", file=sys.stderr)
 
@@ -57,7 +60,10 @@ try:
     from packaging.requirements import Requirement  # noqa: F401
 except ModuleNotFoundError:
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", "packaging"]
+        [sys.executable, "-m", "pip", "install", "--quiet", "packaging"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 _check_and_install(_DEPS)
@@ -71,6 +77,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import wave
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -105,19 +112,42 @@ logger = logging.getLogger(__name__)
 # Terminal device picker
 # ---------------------------------------------------------------------------
 
-def _get_input_devices() -> list[tuple[int, str]]:
-    """Return list of (index, name) for all PortAudio input devices."""
+class _DeviceInfo:
+    """Device capabilities captured once while PortAudio is stable."""
+    __slots__ = ("index", "name", "sample_rate", "channels")
+
+    def __init__(self, index: int, name: str, sample_rate: int, channels: int) -> None:
+        self.index = index
+        self.name = name
+        self.sample_rate = sample_rate
+        self.channels = channels
+
+
+def _get_input_devices() -> list[_DeviceInfo]:
+    """Return a _DeviceInfo list for every PortAudio input device.
+
+    Capabilities (sample_rate, channels) are read here — while PortAudio is
+    already fully initialised — so that _listen() never has to re-query them
+    after a Pa_Terminate/Pa_Initialize cycle, which transiently reports zero
+    channels on many ALSA systems and causes "Invalid audio channels".
+    """
     devnull_fds = (os.open(os.devnull, os.O_WRONLY), os.open(os.devnull, os.O_WRONLY))
     saved = (os.dup(sys.stdout.fileno()), os.dup(sys.stderr.fileno()))
     os.dup2(devnull_fds[0], sys.stdout.fileno())
     os.dup2(devnull_fds[1], sys.stderr.fileno())
     try:
         p = pyaudio.PyAudio()
-        devices = []
+        devices: list[_DeviceInfo] = []
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
-            if info.get("maxInputChannels", 0) >= 1:
-                devices.append((i, info["name"]))
+            max_ch = int(info.get("maxInputChannels", 0))
+            if max_ch >= 1:
+                devices.append(_DeviceInfo(
+                    index=i,
+                    name=str(info["name"]),
+                    sample_rate=int(info["defaultSampleRate"]),
+                    channels=min(max_ch, _DEFAULT_CHANNELS),
+                ))
         p.terminate()
     finally:
         os.dup2(saved[0], sys.stdout.fileno())
@@ -127,7 +157,7 @@ def _get_input_devices() -> list[tuple[int, str]]:
     return devices
 
 
-def _pick_device_curses(stdscr, devices: list[tuple[int, str]]) -> int:
+def _pick_device_curses(stdscr, devices: list[_DeviceInfo]) -> int:
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
@@ -144,11 +174,11 @@ def _pick_device_curses(stdscr, devices: list[tuple[int, str]]) -> int:
         stdscr.addstr(0, 0, header[:w - 1], curses.color_pair(2) | curses.A_BOLD)
         stdscr.addstr(1, 0, ("─" * min(w - 1, 66))[:w - 1], curses.color_pair(2))
 
-        for row, (idx, name) in enumerate(devices):
+        for row, dev in enumerate(devices):
             y = row + 2
             if y >= h - 1:
                 break
-            label = f"  [{idx}]  {name}"[:w - 1]
+            label = f"  [{dev.index}]  {dev.name}"[:w - 1]
             if row == selected:
                 stdscr.addstr(y, 0, label.ljust(min(w - 1, 66))[:w - 1], curses.color_pair(1) | curses.A_BOLD)
             else:
@@ -162,20 +192,22 @@ def _pick_device_curses(stdscr, devices: list[tuple[int, str]]) -> int:
         elif key in (curses.KEY_DOWN, ord("j")) and selected < len(devices) - 1:
             selected += 1
         elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            return devices[selected][0]
+            return selected  # list position, not device index
         elif key in (ord("q"), 27):
             sys.exit(0)
 
 
-def _pick_device(devices: list[tuple[int, str]]) -> int:
+def _pick_device(devices: list[_DeviceInfo]) -> _DeviceInfo:
+    """Interactively (or automatically) choose a device; return its _DeviceInfo."""
     if not devices:
         print("No input devices found. Check your audio configuration.", file=sys.stderr)
         sys.exit(1)
     if len(devices) == 1:
-        idx, name = devices[0]
-        print(f"Using only available device: [{idx}] {name}")
-        return idx
-    return curses.wrapper(_pick_device_curses, devices)
+        dev = devices[0]
+        print(f"Using only available device: [{dev.index}] {dev.name}")
+        return dev
+    pos = curses.wrapper(_pick_device_curses, devices)
+    return devices[pos]
 
 
 # ---------------------------------------------------------------------------
@@ -191,14 +223,17 @@ def _console() -> Iterator[Console]:
     This is done because of PyAudio's misbehaving internals.
     See: https://stackoverflow.com/questions/67765911
     """
+    dup_fds = (os.dup(sys.stdout.fileno()), os.dup(sys.stderr.fileno()))
+    null_fds = tuple(os.open(os.devnull, os.O_WRONLY) for _ in range(2))
+    os.dup2(null_fds[0], sys.stdout.fileno())
+    os.dup2(null_fds[1], sys.stderr.fileno())
+    # closefd=False: the Python file object must not own dup_fds[1]; the
+    # finally block closes it explicitly to avoid a double-close.
+    dup_stderr = open(dup_fds[1], mode="w", closefd=False)
     try:
-        dup_fds = (os.dup(sys.stdout.fileno()), os.dup(sys.stderr.fileno()))
-        null_fds = tuple(os.open(os.devnull, os.O_WRONLY) for _ in range(2))
-        os.dup2(null_fds[0], sys.stdout.fileno())
-        os.dup2(null_fds[1], sys.stderr.fileno())
-        dup_stderr = os.fdopen(dup_fds[1], mode="w")
         yield Console(file=dup_stderr)
     finally:
+        dup_stderr.flush()
         os.dup2(dup_fds[0], sys.stdout.fileno())
         os.dup2(dup_fds[1], sys.stderr.fileno())
         for fd in [*null_fds, *dup_fds]:
@@ -221,25 +256,29 @@ def _listen(console: Console, args: argparse.Namespace) -> AudioSegment:
     Callback mode lets PortAudio manage its own buffer on its own schedule,
     which avoids the -9981 overflow errors that the blocking read() loop causes
     when the device's native sample rate doesn't match our chunk math.
-    We hand shazamio an AudioSegment directly — no sample-rate knowledge needed.
+
+    Rate and channel count come from args._device_info (captured at pick time
+    while PortAudio was stable), not from a fresh get_device_info_by_index
+    call that would run against a just-reinitialised PortAudio instance and
+    may transiently return zeros.
     """
+    dev: _DeviceInfo = args._device_info
+    rate = dev.sample_rate
+    channels = dev.channels
+
+    frames: list[bytes] = []
+
+    def _cb(in_data, frame_count, time_info, status):
+        frames.append(in_data)
+        return (None, pyaudio.paContinue)
+
     with _pyaudio_ctx() as p:
-        info = p.get_device_info_by_index(args.device)
-        rate = int(info["defaultSampleRate"])
-        channels = min(1, int(info["maxInputChannels"]))
-
-        frames: list[bytes] = []
-
-        def _cb(in_data, frame_count, time_info, status):
-            frames.append(in_data)
-            return (None, pyaudio.paContinue)
-
         stream = p.open(
             format=_FORMAT,
             channels=channels,
             rate=rate,
             input=True,
-            input_device_index=args.device,
+            input_device_index=dev.index,
             stream_callback=_cb,
         )
 
@@ -247,22 +286,25 @@ def _listen(console: Console, args: argparse.Namespace) -> AudioSegment:
             task = prog.add_task("shaq is listening...", total=args.duration)
             stream.start_stream()
             elapsed = 0.0
-            import time
             while elapsed < args.duration:
                 time.sleep(0.1)
                 elapsed += 0.1
                 prog.update(task, completed=min(elapsed, args.duration))
             stream.stop_stream()
 
+        # Drain the callback thread before closing: stop_stream() only signals
+        # PortAudio to stop; the callback may still be in-flight.
+        while stream.is_active():
+            time.sleep(0.01)
         stream.close()
 
-        raw = b"".join(frames)
-        return AudioSegment(
-            data=raw,
-            sample_width=p.get_sample_size(_FORMAT),
-            frame_rate=rate,
-            channels=channels,
-        )
+    raw = b"".join(frames)
+    return AudioSegment(
+        data=raw,
+        sample_width=pyaudio.get_sample_size(_FORMAT),
+        frame_rate=rate,
+        channels=channels,
+    )
 
 
 def _from_file(console: Console, args: argparse.Namespace) -> AudioSegment:
@@ -271,8 +313,18 @@ def _from_file(console: Console, args: argparse.Namespace) -> AudioSegment:
         return audio[:args.duration * 1000]
 
 
+def _to_wav_bytes(audio: AudioSegment) -> bytes:
+    """Export an AudioSegment to WAV bytes suitable for shazamio."""
+    buf = BytesIO()
+    audio.export(buf, format="wav")
+    return buf.getvalue()
+
+
 async def _shaq(console: Console, args: argparse.Namespace) -> dict[str, Any]:
-    data: AudioSegment | bytearray = _listen(console, args) if args.listen else _from_file(console, args)
+    audio: AudioSegment = _listen(console, args) if args.listen else _from_file(console, args)
+    # shazamio.recognize_song expects bytes; passing an AudioSegment works by
+    # accident some of the time via duck typing but fails unpredictably.
+    data = _to_wav_bytes(audio)
     shazam = Shazam(language="en-US", endpoint_country="US")
     return await shazam.recognize_song(data, proxy=args.proxy)  # type: ignore
 
@@ -339,17 +391,27 @@ def main() -> None:
             print("No input devices found.")
         else:
             print("Available input devices:")
-            for idx, name in devices:
-                print(f"  [{idx}] {name}")
+            for dev in devices:
+                print(f"  [{dev.index}] {dev.name}")
         sys.exit(0)
 
     if not args.listen and args.input is None:
         _parser().error("one of the arguments --listen --input is required")
 
-    # Show interactive picker when --listen is used without --device.
-    if args.listen and args.device is None:
+    # Resolve the device once and store full capabilities on args.
+    # _listen() reads args._device_info directly, bypassing the flaky
+    # re-query that caused "Invalid audio channels" on fresh PortAudio inits.
+    if args.listen:
         devices = _get_input_devices()
-        args.device = _pick_device(devices)
+        if args.device is not None:
+            matching = [d for d in devices if d.index == args.device]
+            if not matching:
+                print(f"Device index {args.device} not found or has no input channels.", file=sys.stderr)
+                sys.exit(1)
+            args._device_info = matching[0]
+        else:
+            args._device_info = _pick_device(devices)
+            args.device = args._device_info.index
 
     with _console() as console:
         logger.addHandler(RichHandler(console=console))
